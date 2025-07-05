@@ -6,8 +6,10 @@ const concat        = require('concat-stream');
 const { DOMParser } = require('@xmldom/xmldom');
 const fileType      = require('file-type');
 const fs            = require('fs');
-const pdfjs         = require('./pdfjs-dist-build/pdf.js');
 const yauzl         = require('yauzl');
+
+/** Load pdfjs-dist once at module scope. This returns a Promise that resolves to the module. */
+const pdfjsPromise = import('pdfjs-dist/legacy/build/pdf.mjs');
 
 /** Header for error messages */
 const ERRORHEADER = "[OfficeParser]: ";
@@ -45,57 +47,266 @@ const parseString = (xml) => {
  * @param {OfficeParserConfig} config   Config Object for officeParser
  * @returns {void}
  */
+
 function parseWord(file, callback, config) {
     /** The target content xml file for the docx file. */
     const mainContentFileRegex = /word\/document[\d+]?.xml/g;
     const footnotesFileRegex   = /word\/footnotes[\d+]?.xml/g;
     const endnotesFileRegex    = /word\/endnotes[\d+]?.xml/g;
+    const stylesFileRegex      = /word\/styles.xml/g;
 
-    extractFiles(file, x => [mainContentFileRegex, footnotesFileRegex, endnotesFileRegex].some(fileRegex => x.match(fileRegex)))
+    extractFiles(file, x => [mainContentFileRegex, footnotesFileRegex, endnotesFileRegex, stylesFileRegex].some(fileRegex => x.match(fileRegex)))
         .then(files => {
             // Verify if atleast the document xml file exists in the extracted files list.
             if (!files.some(file => file.path.match(mainContentFileRegex)))
                 throw ERRORMSG.fileCorrupted(file);
 
-            return files
-                .filter(file => file.path.match(mainContentFileRegex) || file.path.match(footnotesFileRegex) || file.path.match(endnotesFileRegex))
-                .map(file => file.content);
+            const stylesFile = files.find(file => file.path.match(stylesFileRegex));
+            const styleMap = stylesFile ? parseStyles(stylesFile.content) : {};
+
+            return {
+                contentFiles: files
+                    .filter(file => file.path.match(mainContentFileRegex) || file.path.match(footnotesFileRegex) || file.path.match(endnotesFileRegex))
+                    .map(file => file.content),
+                styleMap: styleMap
+            };
         })
-        // ************************************* word xml files explanation *************************************
-        // Structure of xmlContent of a word file is simple.
-        // All text nodes are within w:t tags and each of the text nodes that belong in one paragraph are clubbed together within a w:p tag.
-        // So, we will filter out all the empty w:p tags and then combine all the w:t tag text inside for creating our response text.
-        // ******************************************************************************************************
-        .then(xmlContentArray => {
+        .then(({contentFiles, styleMap}) => {
             /** Store all the text content to respond. */
             let responseText = [];
 
-            xmlContentArray.forEach(xmlContent => {
-                /** Find text nodes with w:p tags */
-                const xmlParagraphNodesList = parseString(xmlContent).getElementsByTagName("w:p");
-                /** Store all the text content to respond */
-                responseText.push(
-                    Array.from(xmlParagraphNodesList)
-                        // Filter paragraph nodes than do not have any text nodes which are identifiable by w:t tag
-                        .filter(paragraphNode => paragraphNode.getElementsByTagName("w:t").length != 0)
-                        .map(paragraphNode => {
-                            // Find text nodes with w:t tags
-                            const xmlTextNodeList = paragraphNode.getElementsByTagName("w:t");
-                            // Join the texts within this paragraph node without any spaces or delimiters.
-                            return Array.from(xmlTextNodeList)
-                                    .filter(textNode => textNode.childNodes[0] && textNode.childNodes[0].nodeValue)
-                                    .map(textNode => textNode.childNodes[0].nodeValue)
-                                    .join("");
-                        })
-                        // Join each paragraph text with a new line delimiter.
-                        .join(config.newlineDelimiter ?? "\n")
-                );
+            contentFiles.forEach(xmlContent => {
+                const doc = parseString(xmlContent);
+                const bodyElements = doc.getElementsByTagName("w:body")[0];
+                if (!bodyElements) return;
+
+                // 获取body下的所有直接子元素
+                const childElements = Array.from(bodyElements.childNodes).filter(node => node.nodeType === 1);
+                
+                childElements.forEach(node => {
+                    /** @type {Element} */
+                    // @ts-ignore
+                    var element = node
+                    if (element.nodeName === "w:tbl") {
+                        // 处理表格
+                        const markdownTable = parseWordTable(element, styleMap);
+                        if (markdownTable) {
+                            responseText.push(markdownTable);
+                        }
+                    } else if (element.nodeName === "w:p") {
+                        // 处理段落
+                        if (element.getElementsByTagName("w:t").length > 0) {
+                            const pStyle = getParagraphStyle(element, styleMap);
+                            
+                            const xmlTextNodeList = element.getElementsByTagName("w:t");
+                            const formattedText = Array.from(xmlTextNodeList)
+                                .filter(textNode => textNode.childNodes[0] && textNode.childNodes[0].nodeValue)
+                                .map(textNode => {
+                                    const text = textNode.childNodes[0].nodeValue;
+                                    const runNode = textNode.parentNode;
+                                    const formatting = runNode ? getTextFormatting(runNode) : {};
+                                    return applyMarkdownFormatting(text, formatting);
+                                })
+                                .join("");
+
+                            const paragraphText = applyParagraphFormatting(formattedText, pStyle);
+                            if (paragraphText.trim()) {
+                                responseText.push(paragraphText);
+                            }
+                        }
+                    }
+                });
             });
 
             // Respond by calling the Callback function.
             callback(responseText.join(config.newlineDelimiter ?? "\n"), undefined);
         })
         .catch(e => callback(undefined, e));
+}
+
+/** Parse Word table and convert to Markdown table
+ * @param  tableElement The w:tbl element
+ * @param {Object} styleMap Style mapping object
+ * @returns {string} Markdown formatted table
+ */
+function parseWordTable(tableElement, styleMap) {
+    const rows = tableElement.getElementsByTagName("w:tr");
+    if (rows.length === 0) return "";
+
+    const tableData = [];
+    let maxCols = 0;
+
+    // 解析所有行
+    Array.from(rows).forEach(row => {
+        const cells = row.getElementsByTagName("w:tc");
+        const rowData = [];
+        
+        Array.from(cells).forEach(cell => {
+            // 获取单元格中的所有段落
+            const paragraphs = cell.getElementsByTagName("w:p");
+            const cellContent = [];
+            
+            Array.from(paragraphs).forEach(paragraph => {
+                const textNodes = paragraph.getElementsByTagName("w:t");
+                if (textNodes.length > 0) {
+                    const paragraphText = Array.from(textNodes)
+                        .filter(textNode => textNode.childNodes[0] && textNode.childNodes[0].nodeValue)
+                        .map(textNode => {
+                            const text = textNode.childNodes[0].nodeValue;
+                            const runNode = textNode.parentNode;
+                            const formatting = runNode ? getTextFormatting(runNode) : {};
+                            return applyMarkdownFormatting(text, formatting);
+                        })
+                        .join("");
+                    
+                    if (paragraphText.trim()) {
+                        cellContent.push(paragraphText.trim());
+                    }
+                }
+            });
+            
+            // 将单元格内容用空格连接，如果为空则用空字符串
+            rowData.push(cellContent.join(" ") || " ");
+        });
+        
+        if (rowData.length > 0) {
+            tableData.push(rowData);
+            maxCols = Math.max(maxCols, rowData.length);
+        }
+    });
+
+    if (tableData.length === 0 || maxCols === 0) return "";
+
+    // 确保所有行都有相同的列数
+    tableData.forEach(row => {
+        while (row.length < maxCols) {
+            row.push(" ");
+        }
+    });
+
+    // 生成Markdown表格
+    let markdownTable = "";
+    
+    // 表格头部（第一行）
+    if (tableData.length > 0) {
+        markdownTable += "| " + tableData[0].join(" | ") + " |\n";
+        
+        // 分隔行
+        markdownTable += "|" + " --- |".repeat(maxCols) + "\n";
+        
+        // 表格数据行（从第二行开始）
+        for (let i = 1; i < tableData.length; i++) {
+            markdownTable += "| " + tableData[i].join(" | ") + " |\n";
+        }
+    }
+    
+    return markdownTable;
+}
+
+/** Parse styles.xml to create a style mapping
+ * @param {string} stylesXml The styles.xml content
+ * @returns {Object} Style mapping object
+ */
+function parseStyles(stylesXml) {
+    const styleMap = {};
+    const doc = parseString(stylesXml);
+    const styles = doc.getElementsByTagName("w:style");
+    
+    Array.from(styles).forEach(style => {
+        const styleId = style.getAttribute("w:styleId");
+        const styleName = style.getElementsByTagName("w:name")[0]?.getAttribute("w:val") || "";
+        const styleType = style.getAttribute("w:type");
+        
+        if (styleId) {
+            styleMap[styleId] = {
+                name: styleName,
+                type: styleType,
+                isHeading: /^heading\s*\d+$/i.test(styleName) || /^title$/i.test(styleName)
+            };
+            
+            // Extract heading level
+            const headingMatch = styleName.match(/heading\s*(\d+)/i);
+            if (headingMatch) {
+                styleMap[styleId].headingLevel = parseInt(headingMatch[1]);
+            } else if (/^title$/i.test(styleName)) {
+                styleMap[styleId].headingLevel = 1;
+            }
+        }
+    });
+    
+    return styleMap;
+}
+
+/** Get paragraph style information
+ * @param {Element} paragraphNode The w:p element
+ * @param {Object} styleMap Style mapping object
+ * @returns {Object} Style information
+ */
+function getParagraphStyle(paragraphNode, styleMap) {
+    const pPr = paragraphNode.getElementsByTagName("w:pPr")[0];
+    if (!pPr) return {};
+    
+    const pStyle = pPr.getElementsByTagName("w:pStyle")[0];
+    if (!pStyle) return {};
+    
+    const styleId = pStyle.getAttribute("w:val");
+    return styleMap[styleId] || {};
+}
+
+/** Get text formatting information from run properties
+ * @param  runNode The w:r element
+ * @returns {Object} Formatting information
+ */
+function getTextFormatting(runNode) {
+    const rPr = runNode.getElementsByTagName("w:rPr")[0];
+    if (!rPr) return {};
+    
+    return {
+        bold: !!rPr.getElementsByTagName("w:b")[0],
+        italic: !!rPr.getElementsByTagName("w:i")[0],
+        underline: !!rPr.getElementsByTagName("w:u")[0],
+        strike: !!rPr.getElementsByTagName("w:strike")[0]
+    };
+}
+
+/** Apply Markdown formatting to text based on run properties
+ * @param {string} text The text content
+ * @param {Object} formatting Formatting information
+ * @returns {string} Markdown formatted text
+ */
+function applyMarkdownFormatting(text, formatting) {
+    let result = text;
+    
+    if (formatting.bold && formatting.italic) {
+        result = `***${result}***`;
+    } else if (formatting.bold) {
+        result = `**${result}**`;
+    } else if (formatting.italic) {
+        result = `*${result}*`;
+    }
+    
+    if (formatting.strike) {
+        result = `~~${result}~~`;
+    }
+    
+    // Note: Markdown doesn't have native underline support
+    // You could use HTML tags if needed: <u>text</u>
+    
+    return result;
+}
+
+/** Apply paragraph-level formatting (headers)
+ * @param {string} text The paragraph text
+ * @param {Object} style Style information
+ * @returns {string} Formatted paragraph
+ */
+function applyParagraphFormatting(text, style) {
+    if (style.isHeading && style.headingLevel) {
+        const headerPrefix = '#'.repeat(Math.min(style.headingLevel, 6));
+        return `${headerPrefix} ${text}`;
+    }
+    
+    return text;
 }
 
 /** Main function for parsing text from PowerPoint files
@@ -134,7 +345,7 @@ function parsePowerPoint(file, callback, config) {
                 files.sort((a, b) => a.path.indexOf("notes") - b.path.indexOf("notes"));
 
             // Returning an array of all the xml contents read using fs.readFileSync
-            return files.map(file => file.content);
+            return files.map(file => ({ content: file.content, path: file.path }));
         })
         // ******************************** powerpoint xml files explanation ************************************
         // Structure of xmlContent of a powerpoint file is simple.
@@ -143,31 +354,67 @@ function parsePowerPoint(file, callback, config) {
         // So, we will filter out all the empty a:p tags and then combine all the a:t tag text inside for creating our response text.
         // ******************************************************************************************************
         .then(xmlContentArray => {
-            /** Store all the text content to respond */
-            let responseText = [];
+            /** Store all the markdown content to respond */
+            let markdownContent = [];
+            let currentSlideNumber = 0;
+            let isProcessingNotes = false;
 
-            xmlContentArray.forEach(xmlContent => {
+            xmlContentArray.forEach(xmlContentObj => {
+                const { content: xmlContent, path } = xmlContentObj;
+                
+                // Extract slide number from path
+                const slideMatch = path.match(slideNumberRegex);
+                const slideNumber = slideMatch ? parseInt(slideMatch[1], 10) : 0;
+                
+                // Check if this is a notes slide
+                const isNotesSlide = path.includes('notes');
+                
+                // If we're starting a new slide (not notes), add slide header
+                if (!isNotesSlide && slideNumber !== currentSlideNumber) {
+                    currentSlideNumber = slideNumber;
+                    markdownContent.push(`\n## 幻灯片 ${slideNumber}\n`);
+                    isProcessingNotes = false;
+                }
+                
+                // If this is a notes slide and we haven't added notes header yet
+                if (isNotesSlide && !isProcessingNotes) {
+                    markdownContent.push(`\n### 备注\n`);
+                    isProcessingNotes = true;
+                }
+
                 /** Find text nodes with a:p tags */
                 const xmlParagraphNodesList = parseString(xmlContent).getElementsByTagName("a:p");
-                /** Store all the text content to respond */
-                responseText.push(
-                    Array.from(xmlParagraphNodesList)
-                        // Filter paragraph nodes than do not have any text nodes which are identifiable by a:t tag
-                        .filter(paragraphNode => paragraphNode.getElementsByTagName("a:t").length != 0)
-                        .map(paragraphNode => {
-                            /** Find text nodes with a:t tags */
-                            const xmlTextNodeList = paragraphNode.getElementsByTagName("a:t");
-                            return Array.from(xmlTextNodeList)
-                                    .filter(textNode => textNode.childNodes[0] && textNode.childNodes[0].nodeValue)
-                                    .map(textNode => textNode.childNodes[0].nodeValue)
-                                    .join("");
-                        })
-                        .join(config.newlineDelimiter ?? "\n")
-                );
+                
+                /** Extract and format paragraph content */
+                const paragraphContent = Array.from(xmlParagraphNodesList)
+                    // Filter paragraph nodes than do not have any text nodes which are identifiable by a:t tag
+                    .filter(paragraphNode => paragraphNode.getElementsByTagName("a:t").length != 0)
+                    .map(paragraphNode => {
+                        /** Find text nodes with a:t tags */
+                        const xmlTextNodeList = paragraphNode.getElementsByTagName("a:t");
+                        const paragraphText = Array.from(xmlTextNodeList)
+                                .filter(textNode => textNode.childNodes[0] && textNode.childNodes[0].nodeValue)
+                                .map(textNode => textNode.childNodes[0].nodeValue)
+                                .join("");
+                        
+                        // Format as markdown list item if it's slide content (not notes)
+                        return isNotesSlide ? paragraphText : `- ${paragraphText}`;
+                    })
+                    .join(config.newlineDelimiter ?? "\n");
+                
+                if (paragraphContent.trim()) {
+                    markdownContent.push(paragraphContent);
+                }
             });
 
-            // Respond by calling the Callback function.
-            callback(responseText.join(config.newlineDelimiter ?? "\n"), undefined);
+            // Join all markdown content and clean up extra newlines
+            const finalMarkdown = markdownContent
+                .join(config.newlineDelimiter ?? "\n")
+                .replace(/\n{3,}/g, '\n\n') // Replace multiple newlines with double newlines
+                .trim();
+
+            // Respond by calling the Callback function with markdown content
+            callback(finalMarkdown, undefined);
         })
         .catch(e => callback(undefined, e));
 }
@@ -271,8 +518,10 @@ function parseExcel(file, callback, config) {
                                         ? sharedStrings[value]
                                         : value;
                             }
-                            // TODO: Add debug asserts for if we reach here which would mean we are filtering more items than we are processing.
-                            // Not the case now but it could happen and it is better to be safe.
+                            // Should not reach here. If we do, it means we are not filtering out items that we are not ready to process.
+                            // Not the case now but it could happen if we change the filtering logic without updating the processing logic.
+                            // So, it is better to error out here.
+                            handleError(`Invalid c node found in sheet xml content: ${cNode}`, callback, config.outputErrorToConsole);
                             return '';
                         })
                         // Join each cell text within a sheet with a space.
@@ -442,14 +691,17 @@ function parseOpenOffice(file, callback, config) {
  * @param {string | Buffer}    file     File path or Buffers
  * @param {function}           callback Callback function that returns value or error
  * @param {OfficeParserConfig} config   Config Object for officeParser
- * @returns {void}
+ * @returns {Promise<void>}
  */
-function parsePdf(file, callback, config) {
-    // Get the pdfjs document for the filepath or buffers.
-    // @ts-ignore
-    pdfjs.getDocument(file).promise
+async function parsePdf(file, callback, config) {
+    // Wait for pdfjs module to be loaded once
+    const pdfjs = await pdfjsPromise;
+
+    // Get the pdfjs document for the filepath or Uint8Array buffers.
+    // pdfjs does not accept Buffers directly, so we convert them to Uint8Array.
+    pdfjs.getDocument(file instanceof Buffer ? new Uint8Array(file) : file).promise
         // We go through each page and build our text content promise array.
-        .then(document => Promise.all(Array.from({ length: document.numPages }, (_, index) => index + 1).map(pageNr => document.getPage(pageNr).then(page => page.getTextContent()))))
+        .then(document => Promise.all(Array.from({ length: document.numPages }, (_, index) => document.getPage(index + 1).then(page => page.getTextContent()))))
         // Each textContent item has property 'items' which is an array of objects.
         // Each object element in the array has text stored in their 'str' key.
         // The concatenation of str is what makes our pdf content.
@@ -462,17 +714,23 @@ function parsePdf(file, callback, config) {
             const responseText = textContentArray
                                     .map(textContent => textContent.items)      // Get all the items
                                     .flat()                                     // Flatten all the items object
-                                    .filter(item => item.str != '')             // Ignore the empty string items.
-                                    .reduce((a, v) => (
-                                        {
-                                            text: a.text + (v.transform[5] != a.transform5 ? (config.newlineDelimiter ?? "\n") : '') + v.str,
-                                            transform5: v.transform[5]
-                                        }),
-                                        {
-                                            text: '',
-                                            transform5: undefined
-                                        }).text;
-            
+                                    .reduce((a, v) =>  (
+                                        // the items could be TextItem or a TextMarkedContent.
+                                        // We are only interested in the TextItem which has a str property.
+                                        'str' in v && v.str != ''
+                                            ? {
+                                                text: a.text + (v.transform[5] != a.transform5 ? (config.newlineDelimiter ?? "\n") : '') + v.str,
+                                                transform5: v.transform[5]
+                                            } : {
+                                                text: a.text,
+                                                transform5: a.transform5
+                                            }
+                                    ),
+                                    {
+                                        text: '',
+                                        transform5: undefined
+                                    }).text;
+
             callback(responseText, undefined);
         })
         .catch(e => callback(undefined, e));
