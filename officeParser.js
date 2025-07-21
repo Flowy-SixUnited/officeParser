@@ -439,26 +439,15 @@ function parseExcel(file, callback, config) {
                 throw ERRORMSG.fileCorrupted(file);
 
             return {
-                sheetFiles:        files.filter(file => file.path.match(sheetsRegex)).map(file => file.content),
+                sheetFiles:        files.filter(file => file.path.match(sheetsRegex)).map((file, index) => ({content: file.content, index: index + 1})),
                 drawingFiles:      files.filter(file => file.path.match(drawingsRegex)).map(file => file.content),
                 chartFiles:        files.filter(file => file.path.match(chartsRegex)).map(file => file.content),
                 sharedStringsFile: files.filter(file => file.path == stringsFilePath).map(file => file.content)[0],
             };
         })
-        // ********************************** excel xml files explanation ***************************************
-        // Structure of xmlContent of an excel file is a bit complex.
-        // We usually have a sharedStrings.xml file which has strings inside t tags
-        // However, this file is not necessary to be present. It is sometimes absent if the file has no shared strings indices represented in v nodes.
-        // Each sheet has an individual sheet xml file which has numbers in v tags (probably value) inside c tags (probably cell)
-        // Each value of v tag is to be used as it is if the "t" attribute (probably type) of c tag is not "s" (probably shared string)
-        // If the "t" attribute of c tag is "s", then we use the value to select value from sharedStrings array with the value as its index.
-        // However, if the "t" attribute of c tag is "inlineStr", strings can be inline inside "is"(probably inside String) > "t".
-        // We extract either the inline strings or use the value to get numbers of text from shared strings.
-        // Drawing files contain all text for each drawing and have text nodes in a:t and paragraph nodes in a:p.
-        // ******************************************************************************************************
         .then(xmlContentFilesObject => {
-            /** Store all the text content to respond */
-            let responseText = [];
+            /** Store all the markdown content to respond */
+            let markdownContent = [];
 
             /** Function to check if the given c node is a valid inline string node. */
             function isValidInlineStringCNode(cNode) {
@@ -483,6 +472,27 @@ function parseExcel(file, callback, config) {
                     && cNode.getElementsByTagName("v")[0].childNodes[0].nodeValue != ''
             }
 
+            /** Function to get cell reference (like A1, B2) from c node */
+            function getCellReference(cNode) {
+                return cNode.getAttribute('r') || '';
+            }
+
+            /** Function to convert cell reference to row and column numbers */
+            function parseReference(ref) {
+                const match = ref.match(/^([A-Z]+)(\d+)$/);
+                if (!match) return { row: 0, col: 0 };
+                
+                const colStr = match[1];
+                const rowNum = parseInt(match[2]);
+                
+                let colNum = 0;
+                for (let i = 0; i < colStr.length; i++) {
+                    colNum = colNum * 26 + (colStr.charCodeAt(i) - 64);
+                }
+                
+                return { row: rowNum, col: colNum };
+            }
+
             /** Find text nodes with t tags in sharedStrings xml file. If the sharedStringsFile is not present, we return an empty array. */
             const sharedStringsXmlTNodesList = xmlContentFilesObject.sharedStringsFile != undefined ? parseString(xmlContentFilesObject.sharedStringsFile).getElementsByTagName("t")
                                                                                                     : [];
@@ -490,22 +500,40 @@ function parseExcel(file, callback, config) {
             const sharedStrings = Array.from(sharedStringsXmlTNodesList)
                                     .map(tNode => tNode.childNodes[0]?.nodeValue ?? '');
 
-            // Parse Sheet files
-            xmlContentFilesObject.sheetFiles.forEach(sheetXmlContent => {
-                /** Find text nodes with c tags in sharedStrings xml file */
+            // Parse Sheet files and convert to markdown tables
+            xmlContentFilesObject.sheetFiles.forEach(sheetData => {
+                const sheetXmlContent = sheetData.content;
+                const sheetIndex = sheetData.index;
+                
+                markdownContent.push(`## 工作表 ${sheetIndex}\n`);
+                
+                /** Find text nodes with c tags in sheet xml file */
                 const sheetsXmlCNodesList = parseString(sheetXmlContent).getElementsByTagName("c");
-                // Traverse through the nodes list and fill responseText with either the number value in its v node or find a mapped string from sharedStrings or an inline string.
-                responseText.push(
-                    Array.from(sheetsXmlCNodesList)
-                        // Filter out invalid c nodes
-                        .filter(cNode => isValidInlineStringCNode(cNode) || hasValidVNodeInCNode(cNode))
-                        .map(cNode => {
+                
+                // Create a map to store cell data by position
+                const cellData = new Map();
+                let maxRow = 0;
+                let maxCol = 0;
+                
+                // Process all cells and organize by position
+                Array.from(sheetsXmlCNodesList)
+                    .filter(cNode => isValidInlineStringCNode(cNode) || hasValidVNodeInCNode(cNode))
+                    .forEach(cNode => {
+                        const cellRef = getCellReference(cNode);
+                        const { row, col } = parseReference(cellRef);
+                        
+                        if (row > 0 && col > 0) {
+                            maxRow = Math.max(maxRow, row);
+                            maxCol = Math.max(maxCol, col);
+                            
+                            let cellValue = '';
+                            
                             // Processing if this is a valid inline string c node.
-                            if (isValidInlineStringCNode(cNode))
-                                return cNode.getElementsByTagName('is')[0].getElementsByTagName('t')[0].childNodes[0].nodeValue;
-
+                            if (isValidInlineStringCNode(cNode)) {
+                                cellValue = cNode.getElementsByTagName('is')[0].getElementsByTagName('t')[0].childNodes[0].nodeValue;
+                            }
                             // Processing if this c node has a valid v node.
-                            if (hasValidVNodeInCNode(cNode)) {
+                            else if (hasValidVNodeInCNode(cNode)) {
                                 /** Flag whether this node's value represents an index in the shared string array */
                                 const isIndexInSharedStrings = cNode.getAttribute("t") == "s";
                                 /** Find value nodes represented by v tags */
@@ -514,29 +542,56 @@ function parseExcel(file, callback, config) {
                                 if (isIndexInSharedStrings && value >= sharedStrings.length)
                                     throw ERRORMSG.fileCorrupted(file);
 
-                                return isIndexInSharedStrings
+                                cellValue = isIndexInSharedStrings
                                         ? sharedStrings[value]
-                                        : value;
+                                        : value.toString();
                             }
-                            // Should not reach here. If we do, it means we are not filtering out items that we are not ready to process.
-                            // Not the case now but it could happen if we change the filtering logic without updating the processing logic.
-                            // So, it is better to error out here.
-                            handleError(`Invalid c node found in sheet xml content: ${cNode}`, callback, config.outputErrorToConsole);
-                            return '';
-                        })
-                        // Join each cell text within a sheet with a space.
-                        .join(config.newlineDelimiter ?? "\n")
-                );
+                            
+                            cellData.set(`${row}-${col}`, cellValue);
+                        }
+                    });
+                
+                // Generate markdown table if we have data
+                if (maxRow > 0 && maxCol > 0) {
+                    // Create table header
+                    let tableHeader = '|';
+                    let tableSeparator = '|';
+                    for (let col = 1; col <= maxCol; col++) {
+                        const colLetter = String.fromCharCode(64 + col);
+                        tableHeader += ` ${colLetter} |`;
+                        tableSeparator += ' --- |';
+                    }
+                    
+                    markdownContent.push(tableHeader);
+                    markdownContent.push(tableSeparator);
+                    
+                    // Create table rows
+                    for (let row = 1; row <= maxRow; row++) {
+                        let tableRow = '|';
+                        for (let col = 1; col <= maxCol; col++) {
+                            const cellValue = cellData.get(`${row}-${col}`) || '';
+                            // Escape markdown special characters in cell content
+                            const escapedValue = cellValue.toString().replace(/\|/g, '\\|').replace(/\n/g, '<br>');
+                            tableRow += ` ${escapedValue} |`;
+                        }
+                        markdownContent.push(tableRow);
+                    }
+                } else {
+                    markdownContent.push('*此工作表为空*');
+                }
+                
+                markdownContent.push(''); // Add empty line after each sheet
             });
 
             // Parse Drawing files
-            xmlContentFilesObject.drawingFiles.forEach(drawingXmlContent => {
-                /** Find text nodes with a:p tags */
-                const drawingsXmlParagraphNodesList = parseString(drawingXmlContent).getElementsByTagName("a:p");
-                /** Store all the text content to respond */
-                responseText.push(
-                    Array.from(drawingsXmlParagraphNodesList)
-                        // Filter paragraph nodes than do not have any text nodes which are identifiable by a:t tag
+            if (xmlContentFilesObject.drawingFiles.length > 0) {
+                markdownContent.push('## 绘图内容\n');
+                
+                xmlContentFilesObject.drawingFiles.forEach((drawingXmlContent, index) => {
+                    /** Find text nodes with a:p tags */
+                    const drawingsXmlParagraphNodesList = parseString(drawingXmlContent).getElementsByTagName("a:p");
+                    
+                    const drawingTexts = Array.from(drawingsXmlParagraphNodesList)
                         .filter(paragraphNode => paragraphNode.getElementsByTagName("a:t").length != 0)
                         .map(paragraphNode => {
                             /** Find text nodes with a:t tags */
@@ -546,25 +601,44 @@ function parseExcel(file, callback, config) {
                                     .map(textNode => textNode.childNodes[0].nodeValue)
                                     .join("");
                         })
-                        .join(config.newlineDelimiter ?? "\n")
-                );
-            });
+                        .filter(text => text.trim() !== '');
+                    
+                    if (drawingTexts.length > 0) {
+                        markdownContent.push(`### 绘图 ${index + 1}\n`);
+                        drawingTexts.forEach(text => {
+                            markdownContent.push(`- ${text}`);
+                        });
+                        markdownContent.push(''); // Add empty line
+                    }
+                });
+            }
 
             // Parse Chart files
-            xmlContentFilesObject.chartFiles.forEach(chartXmlContent => {
-                /** Find text nodes with c:v tags */
-                const chartsXmlCVNodesList = parseString(chartXmlContent).getElementsByTagName("c:v");
-                /** Store all the text content to respond */
-                responseText.push(
-                    Array.from(chartsXmlCVNodesList)
+            if (xmlContentFilesObject.chartFiles.length > 0) {
+                markdownContent.push('## 图表数据\n');
+                
+                xmlContentFilesObject.chartFiles.forEach((chartXmlContent, index) => {
+                    /** Find text nodes with c:v tags */
+                    const chartsXmlCVNodesList = parseString(chartXmlContent).getElementsByTagName("c:v");
+                    
+                    const chartValues = Array.from(chartsXmlCVNodesList)
                         .filter(cVNode => cVNode.childNodes[0] && cVNode.childNodes[0].nodeValue)
                         .map(cVNode => cVNode.childNodes[0].nodeValue)
-                        .join(config.newlineDelimiter ?? "\n")
-                );
-            });
+                        .filter(value => value.trim() !== '');
+                    
+                    if (chartValues.length > 0) {
+                        markdownContent.push(`### 图表 ${index + 1}\n`);
+                        chartValues.forEach(value => {
+                            markdownContent.push(`- ${value}`);
+                        });
+                        markdownContent.push(''); // Add empty line
+                    }
+                });
+            }
 
-            // Respond by calling the Callback function.
-            callback(responseText.join(config.newlineDelimiter ?? "\n"), undefined);
+            // Respond by calling the Callback function with markdown content
+            const finalMarkdown = markdownContent.join(config.newlineDelimiter ?? "\n");
+            callback(finalMarkdown, undefined);
         })
         .catch(e => callback(undefined, e));
 }
@@ -609,15 +683,107 @@ function parseOpenOffice(file, callback, config) {
             /** List of notes tags */
             const notesTag = "presentation:notes";
 
+            /** Parse OpenOffice table and convert to Markdown table */
+            function parseOpenOfficeTable(tableElement) {
+                const rows = tableElement.getElementsByTagName("table:table-row");
+                if (rows.length === 0) return "";
+
+                const tableData = [];
+                let maxCols = 0;
+
+                // Extract data from each row
+                for (let i = 0; i < rows.length; i++) {
+                    const row = rows[i];
+                    const cells = row.getElementsByTagName("table:table-cell");
+                    const rowData = [];
+
+                    for (let j = 0; j < cells.length; j++) {
+                        const cell = cells[j];
+                        const cellContent = [];
+                        
+                        // Extract text from paragraphs within the cell
+                        const paragraphs = cell.getElementsByTagName("text:p");
+                        for (let k = 0; k < paragraphs.length; k++) {
+                            const paragraphText = extractTextFromNode(paragraphs[k]);
+                            if (paragraphText.trim()) {
+                                cellContent.push(paragraphText.trim());
+                            }
+                        }
+                        
+                        // Handle repeated columns (table:number-columns-repeated)
+                        const colsRepeated = cell.getAttribute("table:number-columns-repeated");
+                        const repeatCount = colsRepeated ? parseInt(colsRepeated, 10) : 1;
+                        
+                        const cellText = cellContent.join(" ") || " ";
+                        for (let r = 0; r < repeatCount; r++) {
+                            rowData.push(cellText);
+                        }
+                    }
+                    
+                    if (rowData.length > 0) {
+                        tableData.push(rowData);
+                        maxCols = Math.max(maxCols, rowData.length);
+                    }
+                }
+
+                if (tableData.length === 0) return "";
+
+                // Normalize all rows to have the same number of columns
+                tableData.forEach(row => {
+                    while (row.length < maxCols) {
+                        row.push(" ");
+                    }
+                });
+
+                // Generate markdown table
+                let markdownTable = "\n";
+                
+                // Header row
+                markdownTable += "|" + tableData[0].map(cell => {
+                    // Escape markdown special characters
+                    const escapedCell = cell.replace(/\|/g, '\\|').replace(/\n/g, '<br>');
+                    return ` ${escapedCell} `;
+                }).join("|") + "|\n";
+                
+                // Separator row
+                markdownTable += "|" + Array(maxCols).fill(" --- ").join("|") + "|\n";
+                
+                // Data rows
+                for (let i = 1; i < tableData.length; i++) {
+                    markdownTable += "|" + tableData[i].map(cell => {
+                        // Escape markdown special characters
+                        const escapedCell = cell.replace(/\|/g, '\\|').replace(/\n/g, '<br>');
+                        return ` ${escapedCell} `;
+                    }).join("|") + "|\n";
+                }
+                
+                markdownTable += "\n";
+                return markdownTable;
+            }
+
+            /** Extract text content from a node recursively */
+            function extractTextFromNode(node) {
+                let text = "";
+                if (node.nodeType === 3) { // Text node
+                    text += node.nodeValue || "";
+                } else if (node.nodeType === 1) { // Element node
+                    for (let i = 0; i < node.childNodes.length; i++) {
+                        text += extractTextFromNode(node.childNodes[i]);
+                    }
+                }
+                return text;
+            }
+
             /** Main dfs traversal function that goes from one node to its children and returns the value out. */
             function extractAllTextsFromNode(root) {
                 let xmlTextArray = []
                 for (let i = 0; i < root.childNodes.length; i++)
-                    traversal(root.childNodes[i], xmlTextArray, true);
+                    traversal(root.childNodes[i], xmlTextArray, true, root.tagName);
                 return xmlTextArray.join("");
             }
+            
             /** Traversal function that gets recursive calling. */
-            function traversal(node, xmlTextArray, isFirstRecursion) {
+            function traversal(node, xmlTextArray, isFirstRecursion, parentTagName) {
                 if (!node.childNodes || node.childNodes.length == 0) {
                     if (node.parentNode.tagName.indexOf('text') == 0 && node.nodeValue) {
                         if (isNotesNode(node.parentNode) && (config.putNotesAtLast || config.ignoreNotes)) {
@@ -635,7 +801,7 @@ function parseOpenOffice(file, callback, config) {
                 }
 
                 for (let i = 0; i < node.childNodes.length; i++)
-                    traversal(node.childNodes[i], xmlTextArray, false);
+                    traversal(node.childNodes[i], xmlTextArray, false, parentTagName);
             }
 
             /** Checks if the given node has an ancestor which is a notes tag. We use this information to put the notes in the response text and its position. */
@@ -656,35 +822,230 @@ function parseOpenOffice(file, callback, config) {
                 return false;
             }
 
+            /** Convert text to markdown format based on tag type */
+            function formatAsMarkdown(text, tagName) {
+                if (!text.trim()) return '';
+                
+                if (tagName === 'text:h') {
+                    // Convert headings to markdown format
+                    return `## ${text.trim()}\n\n`;
+                } else if (tagName === 'text:p') {
+                    // Convert paragraphs to markdown format
+                    return `${text.trim()}\n\n`;
+                }
+                return text;
+            }
+
             /** The xml string parsed as xml array */
             const xmlContentArray = [xmlContentFilesObject.mainContentFile, ...xmlContentFilesObject.objectContentFiles].map(xmlContent => parseString(xmlContent));
+            
             // Iterate over each xmlContent and extract text from them.
             xmlContentArray.forEach(xmlContent => {
+                // First, process tables
+                const tables = xmlContent.getElementsByTagName("table:table");
+                for (let i = 0; i < tables.length; i++) {
+                    const markdownTable = parseOpenOfficeTable(tables[i]);
+                    if (markdownTable.trim()) {
+                        responseText.push(markdownTable);
+                    }
+                }
+
+                // Then process regular text nodes
                 /** Find text nodes with text:h and text:p tags in xmlContent */
                 const xmlTextNodesList = [...Array.from(xmlContent
                                                 .getElementsByTagName("*"))
                                                 .filter(node => allowedTextTags.includes(node.tagName)
-                                                    && !isInvalidTextNode(node.parentNode))
+                                                    && !isInvalidTextNode(node.parentNode)
+                                                    && !isInsideTable(node))
                                             ];
-                /** Store all the text content to respond */
-                responseText.push(
-                    xmlTextNodesList
-                        // Add every text information from within this textNode and combine them together.
-                        .map(textNode => extractAllTextsFromNode(textNode))
-                        .filter(text => text != "")
-                        .join(config.newlineDelimiter ?? "\n")
-                );
+                
+                /** Check if a node is inside a table */
+                function isInsideTable(node) {
+                    let parent = node.parentNode;
+                    while (parent) {
+                        if (parent.tagName === "table:table") {
+                            return true;
+                        }
+                        parent = parent.parentNode;
+                    }
+                    return false;
+                }
+                
+                const markdownContent = xmlTextNodesList
+                    // Add every text information from within this textNode and combine them together.
+                    .map(textNode => {
+                        const text = extractAllTextsFromNode(textNode);
+                        return formatAsMarkdown(text, textNode.tagName);
+                    })
+                    .filter(text => text.trim() !== "")
+                    .join('');
+                    
+                if (markdownContent.trim()) {
+                    responseText.push(markdownContent);
+                }
             });
 
             // Add notes text at the end if the user config says so.
-            // Note that we already have pushed the text content to notesText array while extracting all texts from the nodes.
-            if (!config.ignoreNotes && config.putNotesAtLast)
-                responseText = [...responseText, ...notesText];
+            if (!config.ignoreNotes && config.putNotesAtLast) {
+                const notesMarkdown = notesText.join('').trim();
+                if (notesMarkdown) {
+                    responseText.push(`\n## 备注\n\n${notesMarkdown}\n`);
+                }
+            }
 
             // Respond by calling the Callback function.
-            callback(responseText.join(config.newlineDelimiter ?? "\n"), undefined);
+            const finalMarkdown = responseText.join('').trim();
+            callback(finalMarkdown, undefined);
         })
         .catch(e => callback(undefined, e));
+}
+
+
+
+/** Helper function to convert text to markdown format
+ * @param {string} text - The raw text content
+ * @returns {string} - Formatted markdown text
+ */
+function convertToMarkdown(text) {
+    // Split text into lines
+    const lines = text.split('\n');
+    let markdownText = '';
+    
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        
+        // Skip empty lines
+        if (!line) {
+            markdownText += '\n';
+            continue;
+        }
+        
+        let isHeading = false;
+        
+        // Method 1: All caps lines (更宽松)
+        if (line.match(/^[A-Z\s\d\.\-\(\)\:]+$/) && 
+            line.length > 2 && 
+            line.length < 100 && 
+            !line.includes('://')) { // 只排除URL
+            
+            const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+            const prevLine = i > 0 ? lines[i - 1].trim() : '';
+            
+            // 更宽松的上下文检查
+            if ((!prevLine || prevLine.length === 0) || 
+                (!nextLine || nextLine.length === 0) ||
+                i === 0 || i === lines.length - 1 ||
+                (nextLine.length === 0) || // 只要后面有空行就可以
+                (prevLine.length > 0 && nextLine.length > 0 && line.length < 30)) { // 短行也可以
+                isHeading = true;
+            }
+        }
+        
+        // Method 2: 数字编号模式（更宽松）
+        if (line.match(/^\d+(\.\d+)*[\.\)]?\s*[A-Za-z\u4e00-\u9fff]/) && 
+            line.length < 120) {
+            isHeading = true;
+        }
+        
+        // Method 3: 常见标题词（英文+中文）
+        if (line.match(/^(Chapter|Section|Part|Appendix|Introduction|Conclusion|Summary|Overview|Abstract|Background|Method|Result|Discussion|Example|Sample|Demo|Tutorial|Guide|Manual|Reference|API|Usage|Installation|Configuration|Setup|第.*章|第.*节|第.*部分|章节|摘要|总结|概述|介绍|结论|背景|方法|结果|讨论|示例|样例|演示|教程|指南|手册|参考|用法|安装|配置|设置|前言|序言|目录|附录|说明|描述|定义|原理|实现|应用|测试|验证|分析|评估|比较|优化|改进|扩展|未来|展望|致谢|参考文献)\s+/i) &&
+            line.length < 100) {
+            isHeading = true;
+        }
+        
+        // Method 4: 标题格式（更宽松，支持中文）
+        if (line.match(/^[A-Z\u4e00-\u9fff][A-Za-z\u4e00-\u9fff\s\d\-\.\:]+$/) && 
+            line.length > 3 && 
+            line.length < 80 &&
+            !line.endsWith('.') &&
+            !line.includes('://') &&
+            line.split(/\s+/).length <= 12) { // 允许更多单词
+            
+            const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+            const prevLine = i > 0 ? lines[i - 1].trim() : '';
+            
+            // 更宽松的条件
+            if ((!prevLine || prevLine.length === 0) || 
+                (!nextLine || nextLine.length === 0) ||
+                i === 0 || i === lines.length - 1 ||
+                (line.length < 40)) { // 短行更容易被识别为标题
+                isHeading = true;
+            }
+        }
+        
+        // Method 5: 混合大小写标题（新增，支持中文）
+        if (line.match(/^[A-Z\u4e00-\u9fff][a-z\u4e00-\u9fff]+(?:\s+[A-Za-z\u4e00-\u9fff][a-z\u4e00-\u9fff]*)*$/) && 
+            line.length > 4 && 
+            line.length < 70 &&
+            !line.endsWith('.') &&
+            !line.match(/^(The|A|An|This|That|These|Those|这|那|这些|那些|本|该)\s/)) {
+            
+            const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+            
+            // 如果后面有空行或文档结束
+            if (!nextLine || nextLine.length === 0 || i === lines.length - 1) {
+                isHeading = true;
+            }
+        }
+        
+        // Method 6: 短行标题检测（新增，更激进，支持中文）
+        if (line.length > 2 && line.length < 25 && 
+            line.match(/^[A-Za-z\u4e00-\u9fff][A-Za-z\u4e00-\u9fff\s\d\-]*$/) &&
+            !line.endsWith('.') &&
+            !line.includes('://')) {
+            
+            const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+            const prevLine = i > 0 ? lines[i - 1].trim() : '';
+            
+            // 如果是独立的短行
+            if ((!nextLine || nextLine.length === 0) && 
+                (!prevLine || prevLine.length === 0 || prevLine.length > line.length * 2)) {
+                isHeading = true;
+            }
+        }
+        
+        // Method 7: 冒号结尾的标题（新增，支持中文）
+        if (line.endsWith(':') && 
+            line.length > 3 && 
+            line.length < 60 &&
+            line.match(/^[A-Za-z\u4e00-\u9fff][A-Za-z\u4e00-\u9fff\s\d\-]*:$/)) {
+            isHeading = true;
+        }
+        
+        // Method 8: 中文特有标题模式（新增）
+        if (line.match(/^[一二三四五六七八九十百千万]+[、．\.]\s*[\u4e00-\u9fff]/) && 
+            line.length < 80) {
+            isHeading = true;
+        }
+        
+        // Method 9: 中文括号编号（新增）
+        if (line.match(/^[（\(][一二三四五六七八九十\d]+[）\)]\s*[\u4e00-\u9fff]/) && 
+            line.length < 80) {
+            isHeading = true;
+        }
+        
+        if (isHeading) {
+            markdownText += `## ${line}\n\n`;
+            continue;
+        }
+        
+        // Detect numbered lists
+        if (line.match(/^\d+[\.\)]\s/)) {
+            markdownText += `${line}\n`;
+            continue;
+        }
+        
+        // Detect bullet points
+        if (line.match(/^[\-\*\•]\s/)) {
+            markdownText += `- ${line.substring(2)}\n`;
+            continue;
+        }
+        
+        // Regular paragraph text
+        markdownText += `${line}\n\n`;
+    }
+    
+    return markdownText.trim();
 }
 
 /** Main function for parsing text from pdf files
@@ -731,7 +1092,10 @@ async function parsePdf(file, callback, config) {
                                         transform5: undefined
                                     }).text;
 
-            callback(responseText, undefined);
+            // Convert the extracted text to markdown format
+            const markdownText = convertToMarkdown(responseText);
+            
+            callback(markdownText, undefined);
         })
         .catch(e => callback(undefined, e));
 }
